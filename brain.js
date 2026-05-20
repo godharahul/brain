@@ -16,6 +16,8 @@
 
   const CHANNEL = 'browser-brain';
   const bc = new BroadcastChannel(CHANNEL);
+  const requestMap = new Map();
+  let activeRequestId = null;
 
   const pip = await documentPictureInPicture.requestWindow({ width: 480, height: 640 });
   const d = pip.document;
@@ -62,12 +64,12 @@
         </div>
         <div class="minirow">
           <span class="pill" id="mode">idle</span>
-          <span class="pill" id="model">model: loading...</span>
+          <span class="pill" id="model">model: not loaded</span>
         </div>
         <div class="status" id="status">Ready</div>
-        <div class="hint">Use the guest-tab sender later to push extracted tab data into this brain through <code>${CHANNEL}</code>.</div>
+        <div class="hint">The model loads only after the first command. Guest tabs can send extracted data through <code>${CHANNEL}</code>.</div>
       </div>
-      <div class="out" id="out">Brain is ready to load a model.</div>
+      <div class="out" id="out">Brain is idle. Type a task and hit Run.</div>
     </div>
   </div>`;
 
@@ -76,20 +78,96 @@
   const status = d.getElementById('status');
   const mode = d.getElementById('mode');
   const modelTag = d.getElementById('model');
+  const runBtn = d.getElementById('run');
+  const sumBtn = d.getElementById('sum');
+  const clsBtn = d.getElementById('cls');
+  const pageBtn = d.getElementById('page');
 
   const logs = [];
   const maxLogs = 40;
-  let pipePromise = null;
-  let pipe = null;
-  let tokenizer = null;
 
   const device = navigator.gpu ? 'webgpu' : 'wasm';
   const dtype = navigator.gpu ? 'q4' : 'q8';
+  const modelId = 'HuggingFaceTB/SmolLM2-135M-Instruct';
 
-  // Smaller instruct model for faster load and snappier replies.
-  // Models like SmolLM2-135M-Instruct and SmolLM2-360M-Instruct are available in the
-  // Hugging Face transformers.js model list filtered by text-generation + transformers.js.
-  const modelId = 'HuggingFaceTB/SmolLM2-360M-Instruct';
+  const workerSrc = `
+    import { pipeline, TextStreamer } from 'https://esm.sh/@huggingface/transformers';
+
+    const MODEL_ID = ${JSON.stringify(modelId)};
+    const DEVICE = ${JSON.stringify(device)};
+    const DTYPE = ${JSON.stringify(dtype)};
+
+    let pipe = null;
+    let loading = null;
+    let tokenizer = null;
+
+    function buildPrompt(task, extraContext = '') {
+      const ctx = extraContext ? '\n\nCONTEXT:\n' + extraContext : '';
+      return [
+        '<|system|>',
+        'You are a small browser brain running locally in the user\'s browser.',
+        'Help with actions on extracted page data.',
+        'Return concise, practical answers.',
+        'If the user asks for a plan, return a step-by-step plan.',
+        'If the user asks to classify or extract, return structured output.',
+        'If the data is messy, clean it mentally and respond clearly.',
+        '</s>',
+        '<|user|>',
+        task + ctx,
+        '</s>',
+        '<|assistant|>'
+      ].join('\n');
+    }
+
+    async function getPipe(progressPort) {
+      if (pipe) return pipe;
+      if (!loading) {
+        loading = (async () => {
+          const p = await pipeline('text-generation', MODEL_ID, {
+            device: DEVICE,
+            dtype: DTYPE,
+            progress_callback: (p) => {
+              try { progressPort?.postMessage({ type: 'status', status: typeof p === 'string' ? p : JSON.stringify(p) }); } catch {}
+            }
+          });
+          tokenizer = p.tokenizer;
+          return p;
+        })();
+      }
+      pipe = await loading;
+      return pipe;
+    }
+
+    self.onmessage = async (ev) => {
+      const msg = ev.data || {};
+      if (msg.type !== 'run') return;
+      const { id, text, extraContext = '' } = msg;
+      try {
+        const p = await getPipe(self);
+        const prompt = buildPrompt(text, extraContext);
+        let streamed = '';
+        const streamer = new TextStreamer(tokenizer, {
+          skip_prompt: true,
+          callback_function: (chunk) => {
+            streamed += chunk;
+            self.postMessage({ type: 'chunk', id, chunk, text: streamed });
+          }
+        });
+        self.postMessage({ type: 'ready', id, modelId: MODEL_ID });
+        await p(prompt, {
+          max_new_tokens: 96,
+          do_sample: false,
+          streamer
+        });
+        self.postMessage({ type: 'done', id, text: streamed.trim() || '(no response)' });
+      } catch (err) {
+        self.postMessage({ type: 'error', id, error: err && err.message ? err.message : String(err) });
+      }
+    };
+  `;
+
+  const workerUrl = URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }));
+  const worker = new Worker(workerUrl, { type: 'module' });
 
   function esc(v) {
     return String(v)
@@ -116,111 +194,38 @@
     render();
   }
 
-  function updateLastAssistant(text, streaming = true) {
-    for (let i = logs.length - 1; i >= 0; i--) {
-      if (logs[i].role === 'assistant') {
-        logs[i].text = text;
-        logs[i].streaming = streaming;
-        render();
-        return;
-      }
-    }
+  function updateAssistant(id, text, streaming = true) {
+    const idx = requestMap.get(id);
+    if (idx == null) return;
+    logs[idx].text = text;
+    logs[idx].streaming = streaming;
+    render();
   }
 
   function setStatus(text) { status.textContent = text; }
   function setMode(text) { mode.textContent = text; }
 
-  async function getPipe() {
-    if (pipe) return pipe;
-    if (!pipePromise) {
-      pipePromise = (async () => {
-        setStatus('Loading Transformers.js...');
-        const tf = await import('https://esm.sh/@huggingface/transformers');
-        const { pipeline } = tf;
-        tokenizer = null;
-        setStatus('Loading model...');
-        modelTag.textContent = `model: ${modelId}`;
-        const p = await pipeline('text-generation', modelId, { device, dtype });
-        tokenizer = p.tokenizer;
-        return p;
-      })();
-    }
-    pipe = await pipePromise;
-    return pipe;
-  }
-
-  function buildPrompt(userText, extraContext = '') {
-    const ctx = extraContext ? `\n\nCONTEXT:\n${extraContext}` : '';
-    return `
-<|system|>
-You are a small browser brain running locally in the user's browser.
-Your job is to help with actions on extracted page data.
-Return concise, practical answers.
-If the user asks for a plan, return a step-by-step plan.
-If the user asks to classify or extract, return structured output.
-If the data is messy, clean it mentally and respond clearly.
-</s>
-<|user|>
-${userText}${ctx}
-</s>
-<|assistant|>
-`.trim();
-  }
-
-  async function runBrain({ text, extraContext = '', label = 'assistant' }) {
+  function enqueueTask({ text, extraContext = '', role = 'assistant' }) {
     const task = text.trim();
     if (!task) return;
 
     push('user', task);
-    setMode('thinking');
-    setStatus('Running...');
-
-    const assistantIndex = logs.push({ role: 'assistant', text: '', streaming: true }) - 1;
+    const id = crypto.randomUUID();
+    activeRequestId = id;
+    logs.push({ role, text: '', streaming: true });
+    requestMap.set(id, logs.length - 1);
     render();
-
-    try {
-      const p = await getPipe();
-      const prompt = buildPrompt(task, extraContext);
-      let streamed = '';
-
-      const { TextStreamer } = await import('https://esm.sh/@huggingface/transformers');
-      const streamer = new TextStreamer(tokenizer, {
-        skip_prompt: true,
-        callback_function: (chunk) => {
-          streamed += chunk;
-          logs[assistantIndex].text = streamed;
-          logs[assistantIndex].streaming = true;
-          render();
-        }
-      });
-
-      await p(prompt, {
-        max_new_tokens: 128,
-        do_sample: false,
-        streamer
-      });
-
-      logs[assistantIndex].text = streamed.trim() || '(no response)';
-      logs[assistantIndex].streaming = false;
-      render();
-      setStatus('Ready');
-    } catch (err) {
-      console.error(err);
-      logs[assistantIndex].text = err && err.message ? err.message : String(err);
-      logs[assistantIndex].streaming = false;
-      render();
-      setStatus('Failed');
-    } finally {
-      setMode('idle');
-    }
+    setMode('thinking');
+    setStatus('Queued');
+    worker.postMessage({ type: 'run', id, text: task, extraContext });
   }
 
   async function summarize() {
-    await runBrain({ text: input.value, extraContext: 'Summarize the provided text in a short useful form.' });
+    enqueueTask({ text: input.value, extraContext: 'Summarize the provided text in a short useful form.' });
   }
 
   async function classify() {
-    await runBrain({ text: input.value, extraContext: 'Classify the provided text and explain the category briefly.' });
+    enqueueTask({ text: input.value, extraContext: 'Classify the provided text and explain the category briefly.' });
   }
 
   async function analyzeGuestPayload(payload) {
@@ -234,28 +239,56 @@ ${userText}${ctx}
     ].filter(Boolean).join('\n\n');
 
     push('guest', `Received page snapshot from guest tab:\n${title || '(no title)'}\n${url || ''}`);
-    await runBrain({
+    enqueueTask({
       text: 'Analyze the supplied page snapshot and tell me the best next action I should take on it.',
       extraContext: extra,
-      label: 'assistant'
+      role: 'assistant'
     });
   }
 
-  d.getElementById('run').onclick = () => runBrain({ text: input.value });
-  d.getElementById('sum').onclick = summarize;
-  d.getElementById('cls').onclick = classify;
-  d.getElementById('clear').onclick = () => { logs.length = 0; render(); setStatus('Cleared'); };
+  runBtn.onclick = () => enqueueTask({ text: input.value });
+  sumBtn.onclick = summarize;
+  clsBtn.onclick = classify;
+  pageBtn.onclick = () => enqueueTask({ text: input.value || 'Analyze the current guest page data and tell me what to do next.', extraContext: 'If guest page data arrives later, use it as primary context.' });
+  d.getElementById('clear').onclick = () => { logs.length = 0; requestMap.clear(); render(); setStatus('Cleared'); };
   d.getElementById('close').onclick = () => { pip.close(); };
-  d.getElementById('page').onclick = () => {
-    runBrain({ text: input.value || 'Analyze the current guest page data and tell me what to do next.', extraContext: 'If guest page data arrives later, use it as primary context.' });
-  };
 
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      runBrain({ text: input.value });
+      enqueueTask({ text: input.value });
     }
   });
+
+  worker.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'status') {
+      setStatus(msg.status);
+      return;
+    }
+    if (msg.type === 'ready') {
+      modelTag.textContent = `model: ${msg.modelId}`;
+      setStatus('Model ready');
+      return;
+    }
+    if (msg.type === 'chunk') {
+      updateAssistant(msg.id, msg.text || '', true);
+      setStatus('Thinking...');
+      return;
+    }
+    if (msg.type === 'done') {
+      updateAssistant(msg.id, msg.text || '(no response)', false);
+      setStatus('Ready');
+      setMode('idle');
+      return;
+    }
+    if (msg.type === 'error') {
+      updateAssistant(msg.id, msg.error || 'Error', false);
+      setStatus('Failed');
+      setMode('idle');
+      return;
+    }
+  };
 
   bc.onmessage = async (ev) => {
     const msg = ev.data || {};
@@ -264,18 +297,20 @@ ${userText}${ctx}
     }
     if (msg.type === 'guest:text') {
       push('guest', msg.text || '');
-      await runBrain({ text: msg.text || '', label: 'assistant' });
+      enqueueTask({ text: msg.text || '', role: 'assistant' });
     }
   };
 
-  push('assistant', 'Browser brain opened. Type a task, or send extracted page data from another tab.');
+  push('assistant', 'Browser brain opened. The model will load only after the first command.');
   setStatus('Ready');
   setMode('idle');
-  window.__browserBrainOpen = true;
 
   pip.addEventListener('pagehide', () => {
     window.__browserBrainOpen = false;
     try { bc.close(); } catch {}
+    try { worker.terminate(); } catch {}
+    try { URL.revokeObjectURL(workerUrl); } catch {}
+    requestMap.clear();
     pipe = null;
     pipePromise = null;
   });
