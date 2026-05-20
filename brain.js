@@ -1,375 +1,242 @@
 (async()=>{
+  if (window.__browserBrainOpen) return;
+  window.__browserBrainOpen = true;
 
-if(window.__brain__) return;
-window.__brain__ = true;
+  if (!window.documentPictureInPicture) {
+    alert('Doc PiP not supported');
+    window.__browserBrainOpen = false;
+    return;
+  }
 
-if(!window.documentPictureInPicture){
-  alert("Document PiP not supported");
-  return;
-}
+  if (documentPictureInPicture.window) {
+    documentPictureInPicture.window.close();
+    window.__browserBrainOpen = false;
+    return;
+  }
 
-if(documentPictureInPicture.window){
-  documentPictureInPicture.window.close();
-  return;
-}
+  const CHANNEL = 'browser-brain';
+  const bc = new BroadcastChannel(CHANNEL);
 
-const w =
-  await documentPictureInPicture.requestWindow({
-    width:420,
-    height:420
+  const pip = await documentPictureInPicture.requestWindow({ width: 480, height: 640 });
+  const d = pip.document;
+
+  d.body.innerHTML = `
+  <style>
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:radial-gradient(circle at top,#1f2937,#0b1020 60%);color:#fff;font-family:Arial,system-ui,sans-serif}
+    body{display:flex;align-items:center;justify-content:center}
+    .wrap{width:100%;height:100%;box-sizing:border-box;padding:12px;display:flex;align-items:center;justify-content:center}
+    .card{width:min(460px,100%);height:100%;background:rgba(15,23,42,.94);border:1px solid rgba(255,255,255,.08);border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.35);backdrop-filter:blur(10px);display:flex;flex-direction:column;overflow:hidden}
+    .top{padding:12px 12px 10px;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(17,24,39,.75)}
+    .title{font-size:12px;font-weight:700;letter-spacing:1.6px;opacity:.9;margin-bottom:8px}
+    .status{font-size:11px;opacity:.7;margin-top:6px;min-height:14px}
+    textarea{width:100%;box-sizing:border-box;min-height:88px;resize:vertical;border:1px solid #334155;border-radius:12px;background:#0f172a;color:#fff;padding:10px;font-size:14px;outline:none}
+    .bar{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    button{background:#334155;color:#fff;border:none;border-radius:10px;padding:8px 12px;cursor:pointer;font-size:13px}
+    button.primary{background:#4f46e5}
+    button.good{background:#10b981}
+    button:disabled{opacity:.4;cursor:not-allowed}
+    .out{flex:1;min-height:0;overflow:auto;padding:12px;white-space:pre-wrap;line-height:1.45;font-size:13px;background:linear-gradient(180deg,rgba(15,23,42,.92),rgba(2,6,23,.95))}
+    .msg{border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:10px 12px;margin-bottom:10px;background:rgba(15,23,42,.82)}
+    .msg.user{background:rgba(17,24,39,.95)}
+    .msg.assistant{background:rgba(8,47,73,.45)}
+    .msg.guest{background:rgba(22,101,52,.18)}
+    .label{font-size:11px;opacity:.7;margin-bottom:6px;letter-spacing:.6px;text-transform:uppercase}
+    .hint{font-size:11px;opacity:.65;margin-top:8px;line-height:1.35}
+    .minirow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
+    .pill{font-size:11px;padding:4px 8px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.06)}
+  </style>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <div class="title">BROWSER BRAIN</div>
+        <textarea id="input" placeholder="Ask the brain... Example: summarize this page, classify this data, or tell me the next step."></textarea>
+        <div class="bar">
+          <button class="primary" id="run">Run</button>
+          <button class="good" id="page">Analyze guest page</button>
+          <button id="sum">Summarize</button>
+          <button id="cls">Classify</button>
+          <button id="clear">Clear</button>
+          <button id="close">Close</button>
+        </div>
+        <div class="minirow">
+          <span class="pill" id="mode">idle</span>
+          <span class="pill" id="model">model: loading...</span>
+        </div>
+        <div class="status" id="status">Ready</div>
+        <div class="hint">Use the guest-tab sender later to push extracted tab data into this brain through <code>${CHANNEL}</code>.</div>
+      </div>
+      <div class="out" id="out">Brain is ready to load a model.</div>
+    </div>
+  </div>`;
+
+  const out = d.getElementById('out');
+  const input = d.getElementById('input');
+  const status = d.getElementById('status');
+  const mode = d.getElementById('mode');
+  const modelTag = d.getElementById('model');
+
+  const logs = [];
+  const maxLogs = 40;
+  let pipePromise = null;
+  let pipe = null;
+
+  const device = navigator.gpu ? 'webgpu' : 'wasm';
+  const dtype = navigator.gpu ? 'q4' : 'q8';
+  const modelId = 'Xenova/Phi-3-mini-4k-instruct';
+
+  function esc(v) {
+    return String(v)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  }
+
+  function render() {
+    out.innerHTML = logs.map(m => `
+      <div class="msg ${m.role}">
+        <div class="label">${esc(m.role)}</div>
+        <div>${esc(m.text)}</div>
+      </div>
+    `).join('');
+    out.scrollTop = out.scrollHeight;
+  }
+
+  function push(role, text) {
+    logs.push({ role, text });
+    while (logs.length > maxLogs) logs.shift();
+    render();
+  }
+
+  function setStatus(text) {
+    status.textContent = text;
+  }
+
+  function setMode(text) {
+    mode.textContent = text;
+  }
+
+  async function getPipe() {
+    if (pipe) return pipe;
+    if (!pipePromise) {
+      pipePromise = (async () => {
+        setStatus('Loading Transformers.js...');
+        const { pipeline } = await import('https://esm.sh/@huggingface/transformers');
+        setStatus('Loading model...');
+        modelTag.textContent = `model: ${modelId}`;
+        return pipeline('text-generation', modelId, { device, dtype });
+      })();
+    }
+    pipe = await pipePromise;
+    return pipe;
+  }
+
+  function buildPrompt(userText, extraContext = '') {
+    const ctx = extraContext ? `\n\nCONTEXT:\n${extraContext}` : '';
+    return `
+<|system|>
+You are a small browser brain running locally in the user's browser.
+Your job is to help with actions on extracted page data.
+Return concise, practical answers.
+If the user asks for a plan, return a step-by-step plan.
+If the user asks to classify or extract, return structured output.
+If the data is messy, clean it mentally and respond clearly.
+</s>
+<|user|>
+${userText}${ctx}
+</s>
+<|assistant|>
+`.trim();
+  }
+
+  async function runBrain({ text, extraContext = '', label = 'assistant' }) {
+    const task = text.trim();
+    if (!task) return;
+
+    push('user', task);
+    setMode('thinking');
+    setStatus('Running...');
+
+    try {
+      const p = await getPipe();
+      const prompt = buildPrompt(task, extraContext);
+      const result = await p(prompt, { max_new_tokens: 220, temperature: 0.3, do_sample: false });
+      const answer = Array.isArray(result) ? (result[0]?.generated_text || result[0]?.text || JSON.stringify(result, null, 2)) : String(result);
+      push(label, answer);
+      setStatus('Ready');
+    } catch (err) {
+      console.error(err);
+      push('error', err && err.message ? err.message : String(err));
+      setStatus('Failed');
+    } finally {
+      setMode('idle');
+    }
+  }
+
+  async function summarize() {
+    await runBrain({ text: input.value, extraContext: 'Summarize the provided text in a short useful form.' });
+  }
+
+  async function classify() {
+    await runBrain({ text: input.value, extraContext: 'Classify the provided text and explain the category briefly.' });
+  }
+
+  async function analyzeGuestPayload(payload) {
+    const title = payload?.title || '';
+    const url = payload?.url || '';
+    const text = payload?.text || payload?.data || '';
+    const extra = [
+      title ? `Page title: ${title}` : '',
+      url ? `URL: ${url}` : '',
+      text ? `Extracted page data:\n${text.slice(0, 6000)}` : ''
+    ].filter(Boolean).join('\n\n');
+
+    push('guest', `Received page snapshot from guest tab:\n${title || '(no title)'}\n${url || ''}`);
+    await runBrain({
+      text: 'Analyze the supplied page snapshot and tell me the best next action I should take on it.',
+      extraContext: extra,
+      label: 'assistant'
+    });
+  }
+
+  d.getElementById('run').onclick = () => runBrain({ text: input.value });
+  d.getElementById('sum').onclick = summarize;
+  d.getElementById('cls').onclick = classify;
+  d.getElementById('clear').onclick = () => { logs.length = 0; render(); setStatus('Cleared'); };
+  d.getElementById('close').onclick = () => { pip.close(); };
+  d.getElementById('page').onclick = () => {
+    runBrain({ text: input.value || 'Analyze the current guest page data and tell me what to do next.', extraContext: 'If guest page data arrives later, use it as primary context.' });
+  };
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      runBrain({ text: input.value });
+    }
   });
 
-const d = w.document;
-
-d.body.innerHTML = `
-<style>
-
-html,body{
-  margin:0;
-  width:100%;
-  height:100%;
-  overflow:hidden;
-  background:#111827;
-  color:white;
-  font-family:Arial,system-ui,sans-serif;
-}
-
-body{
-  display:flex;
-  flex-direction:column;
-}
-
-.top{
-  padding:12px;
-  background:#0f172a;
-  border-bottom:1px solid #334155;
-}
-
-.title{
-  font-size:12px;
-  font-weight:700;
-  letter-spacing:1.5px;
-  opacity:.85;
-  margin-bottom:10px;
-}
-
-textarea{
-  width:100%;
-  min-height:90px;
-  resize:none;
-  box-sizing:border-box;
-  background:#111827;
-  color:white;
-  border:1px solid #334155;
-  border-radius:10px;
-  padding:10px;
-  font-size:14px;
-}
-
-.bar{
-  display:flex;
-  gap:8px;
-  margin-top:10px;
-}
-
-button{
-  background:#334155;
-  color:white;
-  border:none;
-  border-radius:10px;
-  padding:8px 12px;
-  cursor:pointer;
-  font-size:13px;
-}
-
-button.primary{
-  background:#4f46e5;
-}
-
-.out{
-  flex:1;
-  overflow:auto;
-  padding:12px;
-  white-space:pre-wrap;
-  line-height:1.45;
-  font-size:13px;
-}
-
-.status{
-  font-size:11px;
-  opacity:.7;
-  margin-top:8px;
-}
-
-.card{
-  border:1px solid #334155;
-  border-radius:12px;
-  padding:10px;
-  background:#0f172a;
-  margin-bottom:10px;
-}
-
-.label{
-  font-size:11px;
-  opacity:.7;
-  margin-bottom:6px;
-}
-
-</style>
-
-<div class="top">
-
-  <div class="title">
-    TRANSFORMERS.JS BRAIN
-  </div>
-
-  <textarea
-    id="input"
-    placeholder="Type task text here..."
-  ></textarea>
-
-  <div class="bar">
-    <button class="primary" id="run">
-      Run
-    </button>
-
-    <button id="sum">
-      Summarize
-    </button>
-
-    <button id="cls">
-      Classify
-    </button>
-
-    <button id="clear">
-      Clear
-    </button>
-
-    <button id="close">
-      Close
-    </button>
-  </div>
-
-  <div class="status" id="status">
-    Ready
-  </div>
-
-</div>
-
-<div class="out" id="out">
-  Browser Brain Ready
-</div>
-`;
-
-const out =
-  d.getElementById("out");
-
-const status =
-  d.getElementById("status");
-
-const input =
-  d.getElementById("input");
-
-function log(label,text){
-
-  out.innerHTML =
-    `
-      <div class="card">
-        <div class="label">${label}</div>
-        <div>${text}</div>
-      </div>
-    ` + out.innerHTML;
-}
-
-function setStatus(text){
-  status.textContent = text;
-}
-
-const transformers =
-  await import(
-    "https://esm.sh/@huggingface/transformers"
-  );
-
-const {
-  pipeline
-} = transformers;
-
-const device =
-  navigator.gpu
-    ? "webgpu"
-    : "wasm";
-
-const dtype =
-  navigator.gpu
-    ? "q4"
-    : "q8";
-
-setStatus(
-  "Loading models..."
-);
-
-const sentimentPipe =
-  await pipeline(
-    "sentiment-analysis",
-    "Xenova/distilbert-base-uncased-finetuned-sst-2-english",
-    {
-      device,
-      dtype
+  bc.onmessage = async (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'guest:page' || msg.type === 'page' || msg.type === 'data') {
+      await analyzeGuestPayload(msg);
     }
-  );
-
-const summarizePipe =
-  await pipeline(
-    "summarization",
-    "Xenova/distilbart-cnn-6-6",
-    {
-      device,
-      dtype
+    if (msg.type === 'guest:text') {
+      push('guest', msg.text || '');
+      await runBrain({ text: msg.text || '', label: 'assistant' });
     }
-  );
+  };
 
-setStatus(
-  "Brain Ready"
-);
+  push('assistant', 'Browser brain opened. Type a task, or send extracted page data from another tab.');
+  setStatus('Ready');
+  setMode('idle');
+  window.__browserBrainOpen = true;
 
-async function classify(){
-
-  const text =
-    input.value.trim();
-
-  if(!text) return;
-
-  setStatus(
-    "Classifying..."
-  );
-
-  try{
-
-    const result =
-      await sentimentPipe(text);
-
-    log(
-      "Classification",
-      JSON.stringify(
-        result,
-        null,
-        2
-      )
-    );
-
-  }catch(e){
-
-    log(
-      "Error",
-      e.message || String(e)
-    );
-  }
-
-  setStatus(
-    "Ready"
-  );
-}
-
-async function summarize(){
-
-  const text =
-    input.value.trim();
-
-  if(!text) return;
-
-  setStatus(
-    "Summarizing..."
-  );
-
-  try{
-
-    const result =
-      await summarizePipe(
-        text.slice(0,3000),
-        {
-          max_length:80,
-          min_length:20
-        }
-      );
-
-    log(
-      "Summary",
-      result[0].summary_text
-    );
-
-  }catch(e){
-
-    log(
-      "Error",
-      e.message || String(e)
-    );
-  }
-
-  setStatus(
-    "Ready"
-  );
-}
-
-async function smartRun(){
-
-  const text =
-    input.value.trim();
-
-  if(!text) return;
-
-  if(
-    text.length > 300
-  ){
-    await summarize();
-  }else{
-    await classify();
-  }
-}
-
-d.getElementById(
-  "run"
-).onclick = smartRun;
-
-d.getElementById(
-  "sum"
-).onclick = summarize;
-
-d.getElementById(
-  "cls"
-).onclick = classify;
-
-d.getElementById(
-  "clear"
-).onclick = ()=>{
-
-  out.innerHTML =
-    "Cleared";
-
-  input.value = "";
-};
-
-d.getElementById(
-  "close"
-).onclick = ()=>{
-
-  w.close();
-};
-
-input.addEventListener(
-  "keydown",
-  e=>{
-
-    if(
-      e.key === "Enter" &&
-      (
-        e.ctrlKey ||
-        e.metaKey
-      )
-    ){
-      e.preventDefault();
-      smartRun();
-    }
-  }
-);
-
-})();
+  pip.addEventListener('pagehide', () => {
+    window.__browserBrainOpen = false;
+    try { bc.close(); } catch {}
+    pipe = null;
+    pipePromise = null;
+  });
+})()
