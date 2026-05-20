@@ -44,6 +44,7 @@
     .hint{font-size:11px;opacity:.65;margin-top:8px;line-height:1.35}
     .minirow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
     .pill{font-size:11px;padding:4px 8px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.06)}
+    .stream{opacity:.92}
   </style>
 
   <div class="wrap">
@@ -80,10 +81,15 @@
   const maxLogs = 40;
   let pipePromise = null;
   let pipe = null;
+  let tokenizer = null;
 
   const device = navigator.gpu ? 'webgpu' : 'wasm';
   const dtype = navigator.gpu ? 'q4' : 'q8';
-  const modelId = 'Xenova/Phi-3-mini-4k-instruct';
+
+  // Smaller instruct model for faster load and snappier replies.
+  // Models like SmolLM2-135M-Instruct and SmolLM2-360M-Instruct are available in the
+  // Hugging Face transformers.js model list filtered by text-generation + transformers.js.
+  const modelId = 'HuggingFaceTB/SmolLM2-360M-Instruct';
 
   function esc(v) {
     return String(v)
@@ -98,35 +104,45 @@
     out.innerHTML = logs.map(m => `
       <div class="msg ${m.role}">
         <div class="label">${esc(m.role)}</div>
-        <div>${esc(m.text)}</div>
+        <div class="${m.streaming ? 'stream' : ''}">${esc(m.text)}</div>
       </div>
     `).join('');
     out.scrollTop = out.scrollHeight;
   }
 
-  function push(role, text) {
-    logs.push({ role, text });
+  function push(role, text, streaming = false) {
+    logs.push({ role, text, streaming });
     while (logs.length > maxLogs) logs.shift();
     render();
   }
 
-  function setStatus(text) {
-    status.textContent = text;
+  function updateLastAssistant(text, streaming = true) {
+    for (let i = logs.length - 1; i >= 0; i--) {
+      if (logs[i].role === 'assistant') {
+        logs[i].text = text;
+        logs[i].streaming = streaming;
+        render();
+        return;
+      }
+    }
   }
 
-  function setMode(text) {
-    mode.textContent = text;
-  }
+  function setStatus(text) { status.textContent = text; }
+  function setMode(text) { mode.textContent = text; }
 
   async function getPipe() {
     if (pipe) return pipe;
     if (!pipePromise) {
       pipePromise = (async () => {
         setStatus('Loading Transformers.js...');
-        const { pipeline } = await import('https://esm.sh/@huggingface/transformers');
+        const tf = await import('https://esm.sh/@huggingface/transformers');
+        const { pipeline } = tf;
+        tokenizer = null;
         setStatus('Loading model...');
         modelTag.textContent = `model: ${modelId}`;
-        return pipeline('text-generation', modelId, { device, dtype });
+        const p = await pipeline('text-generation', modelId, { device, dtype });
+        tokenizer = p.tokenizer;
+        return p;
       })();
     }
     pipe = await pipePromise;
@@ -159,16 +175,40 @@ ${userText}${ctx}
     setMode('thinking');
     setStatus('Running...');
 
+    const assistantIndex = logs.push({ role: 'assistant', text: '', streaming: true }) - 1;
+    render();
+
     try {
       const p = await getPipe();
       const prompt = buildPrompt(task, extraContext);
-      const result = await p(prompt, { max_new_tokens: 220, temperature: 0.3, do_sample: false });
-      const answer = Array.isArray(result) ? (result[0]?.generated_text || result[0]?.text || JSON.stringify(result, null, 2)) : String(result);
-      push(label, answer);
+      let streamed = '';
+
+      const { TextStreamer } = await import('https://esm.sh/@huggingface/transformers');
+      const streamer = new TextStreamer(tokenizer, {
+        skip_prompt: true,
+        callback_function: (chunk) => {
+          streamed += chunk;
+          logs[assistantIndex].text = streamed;
+          logs[assistantIndex].streaming = true;
+          render();
+        }
+      });
+
+      await p(prompt, {
+        max_new_tokens: 128,
+        do_sample: false,
+        streamer
+      });
+
+      logs[assistantIndex].text = streamed.trim() || '(no response)';
+      logs[assistantIndex].streaming = false;
+      render();
       setStatus('Ready');
     } catch (err) {
       console.error(err);
-      push('error', err && err.message ? err.message : String(err));
+      logs[assistantIndex].text = err && err.message ? err.message : String(err);
+      logs[assistantIndex].streaming = false;
+      render();
       setStatus('Failed');
     } finally {
       setMode('idle');
